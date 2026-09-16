@@ -182,6 +182,27 @@
         color: var(--ink-soft);
         max-width: 60ch;
       }
+      .notice {
+        display: none;
+        border-radius: var(--r);
+        padding: 14px 18px;
+        margin: 18px 0;
+        font-size: 0.92rem;
+        border: 1px solid;
+      }
+      .notice.on {
+        display: block;
+      }
+      .notice.bad {
+        background: rgba(176, 58, 34, 0.08);
+        border-color: rgba(176, 58, 34, 0.35);
+        color: #7a2716;
+      }
+      .notice.info {
+        background: rgba(18, 119, 108, 0.08);
+        border-color: rgba(18, 119, 108, 0.3);
+        color: #0c5249;
+      }
       .facts {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -724,6 +745,8 @@
           </p>
         </div>
 
+        <div class="notice" id="notice"></div>
+
         <div class="facts">
           <div class="fact">
             <span class="n" id="f-q">50</span><span class="l">Questions</span>
@@ -1041,6 +1064,15 @@
         ),
       );
 
+      /* Practice mode: add ?practice=1 to the URL to click through the exam with no
+   screen share and no fullscreen. Use it to demo the exam or check a deploy. */
+      var PRACTICE =
+        (location.search || "").toLowerCase().indexOf("practice=1") > -1;
+      if (PRACTICE) {
+        CONFIG.REQUIRE_SHARE = false;
+        CONFIG.REQUIRE_FULLSCREEN = false;
+      }
+
       var S = {
         name: "",
         email: "",
@@ -1250,7 +1282,6 @@
         show("s-exam");
         renderQ();
         S.timer = setInterval(tick, 1000);
-        if (CONFIG.REQUIRE_FULLSCREEN) goFullscreen();
         armProctor();
       }
       function goFullscreen() {
@@ -1482,58 +1513,130 @@
       }
 
       /* ---------- screen share ---------- */
+      function shareSupported() {
+        return !!(
+          navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia
+        );
+      }
       function requestShare(cb) {
         if (!CONFIG.REQUIRE_SHARE) {
           cb(true, "");
           return;
         }
-        if (
-          !navigator.mediaDevices ||
-          !navigator.mediaDevices.getDisplayMedia
-        ) {
+        if (!shareSupported()) {
           cb(
             false,
-            "This browser does not support screen sharing. Please use Chrome or Edge on a laptop or desktop.",
+            "This browser cannot share your screen. Screen sharing needs Chrome or Edge on a laptop or desktop — it is not available on phones, tablets, or inside an embedded preview window.",
           );
           return;
         }
-        navigator.mediaDevices
-          .getDisplayMedia({
-            video: { displaySurface: "monitor" },
-            audio: false,
-          })
-          .then(function (stream) {
-            var track = stream.getVideoTracks()[0];
-            var surface =
-              (track.getSettings && track.getSettings().displaySurface) || "";
-            if (surface && surface !== "monitor") {
+
+        var settled = false;
+        function done(ok, msg) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(guard);
+          cb(ok, msg);
+        }
+        var guard = setTimeout(function () {
+          done(
+            false,
+            "The screen sharing dialog did not respond. Close any other screen-sharing session (Zoom, Meet, Teams) and try again.",
+          );
+        }, 90000);
+
+        function accept(stream) {
+          var track = stream.getVideoTracks()[0];
+          if (!track) {
+            done(
+              false,
+              "Screen sharing started but returned no video. Please try again.",
+            );
+            return;
+          }
+          var surface =
+            (track.getSettings && track.getSettings().displaySurface) || "";
+          if (surface && surface !== "monitor") {
+            try {
               stream.getTracks().forEach(function (t) {
                 t.stop();
               });
-              cb(
-                false,
-                "You shared a " +
-                  surface +
-                  ". You must share your ENTIRE SCREEN — choose the “Entire Screen” tab in the dialog and try again.",
-              );
+            } catch (e) {}
+            done(
+              false,
+              "You shared a " +
+                surface +
+                ". You must share your ENTIRE SCREEN — choose the “Entire Screen” tab in the dialog and try again.",
+            );
+            return;
+          }
+          S.stream = stream;
+          track.addEventListener("ended", function () {
+            if (!S.done) {
+              violation("Screen sharing stopped");
+            }
+          });
+          done(true, "");
+        }
+
+        /* Some browsers reject or throw on the displaySurface constraint. Fall back
+     to a plain video request rather than leaving the candidate stuck. */
+        function attempt(constraints, isRetry) {
+          var p;
+          try {
+            p = navigator.mediaDevices.getDisplayMedia(constraints);
+          } catch (err) {
+            if (!isRetry) {
+              attempt({ video: true, audio: false }, true);
               return;
             }
-            S.stream = stream;
-            track.addEventListener("ended", function () {
-              if (!S.done) {
-                violation("Screen sharing stopped");
-              }
-            });
-            cb(true, "");
-          })
-          .catch(function (err) {
-            cb(
+            done(
               false,
-              "Screen sharing was not granted (" +
+              "Screen sharing could not start (" +
                 (err && err.name ? err.name : "error") +
-                "). You cannot start the exam without sharing your entire screen.",
+                "). Use Chrome or Edge on a laptop or desktop, then try again.",
             );
+            return;
+          }
+          if (!p || typeof p.then !== "function") {
+            if (!isRetry) {
+              attempt({ video: true, audio: false }, true);
+              return;
+            }
+            done(
+              false,
+              "Screen sharing could not start in this browser. Use Chrome or Edge on a laptop or desktop.",
+            );
+            return;
+          }
+          p.then(accept).catch(function (err) {
+            var n = err && err.name ? err.name : "error";
+            if (
+              !isRetry &&
+              (n === "TypeError" ||
+                n === "OverconstrainedError" ||
+                n === "NotSupportedError" ||
+                n === "InvalidStateError")
+            ) {
+              attempt({ video: true, audio: false }, true);
+              return;
+            }
+            if (n === "NotAllowedError") {
+              done(
+                false,
+                "You cancelled or blocked screen sharing. You cannot start the exam without sharing your entire screen — click the button again and choose “Entire Screen”.",
+              );
+            } else {
+              done(
+                false,
+                "Screen sharing was not granted (" +
+                  n +
+                  "). Check that your browser is allowed to record your screen, then try again.",
+              );
+            }
           });
+        }
+        attempt({ video: { displaySurface: "monitor" }, audio: false }, false);
       }
 
       /* ---------- receipt ---------- */
@@ -1627,6 +1730,43 @@
         }
       });
 
+      /* ---------- failure visibility ----------
+   A silent JavaScript error on an exam page looks like a frozen button to the
+   candidate. Surface anything that goes wrong instead of dying quietly. */
+      window.addEventListener("error", function (e) {
+        try {
+          toast(
+            "Page error: " +
+              (e.message || "unknown") +
+              " — reload and try again.",
+          );
+        } catch (_) {}
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e && e.reason;
+        try {
+          toast(
+            "Page error: " + ((r && (r.message || r.name)) || "request failed"),
+          );
+        } catch (_) {}
+      });
+
+      /* ---------- pre-flight notice ---------- */
+      (function () {
+        var n = $("notice");
+        if (PRACTICE) {
+          n.className = "notice info on";
+          n.innerHTML =
+            "<strong>Practice mode.</strong> Screen sharing and fullscreen are switched off so you can click through the exam freely. Scores are still calculated. Remove <code>?practice=1</code> from the address for the real, proctored exam.";
+          return;
+        }
+        if (CONFIG.REQUIRE_SHARE && !shareSupported()) {
+          n.className = "notice bad on";
+          n.innerHTML =
+            "<strong>This browser cannot run the exam.</strong> It does not support screen sharing, which this exam requires. Open this page in <strong>Chrome or Edge on a laptop or desktop</strong> — phones, tablets and in-app browsers will not work.";
+        }
+      })();
+
       /* ---------- wiring ---------- */
       $("f-q").textContent = BANK.length;
       $("f-m").textContent = CONFIG.EXAM_MINUTES;
@@ -1669,6 +1809,10 @@
         b.disabled = true;
         b.textContent = "Waiting for screen sharing…";
         $("e-setup").textContent = "";
+        /* Fullscreen must be requested inside the click itself — asking for it later,
+     after the screen-share promise resolves, is not a user gesture and browsers
+     silently refuse it. */
+        if (CONFIG.REQUIRE_FULLSCREEN) goFullscreen();
         requestShare(function (ok, msg) {
           if (!ok) {
             b.disabled = false;
@@ -1676,6 +1820,12 @@
             $("e-setup").textContent = msg;
             $("d-share").className = "dot bad";
             $("t-share").textContent = "Screen not shared";
+            if (document.fullscreenElement && document.exitFullscreen) {
+              try {
+                document.exitFullscreen();
+              } catch (e) {}
+            }
+            toast(msg);
             return;
           }
           $("d-share").className = "dot ok";
